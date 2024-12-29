@@ -1,0 +1,252 @@
+#!/usr/bin/env bash
+
+if [[ $# -lt 1 ]]; then
+	echo "Usage: $0 NVIDIA|AMD|list|listjson|listnvidia"
+	exit 1
+fi
+
+source colors
+#[[ -t 1 || $2 == "--colors" ]] && source colors
+
+source /hive/etc/gpu.ids
+
+# Preventing from running nvidia tools if necessary
+[[ -f /run/hive/NV_OFF ]] && NV_OFF=1 || NV_OFF=0
+# disable Nvidia tools if no driver is loaded
+[[ $NV_OFF -eq 0 && `lsmod | grep -c ^nvidia` -eq 0 ]] && NV_OFF=1
+
+
+#NVIDIASMI_FILE_V2=${NVIDIASMI_FILE}_v2
+NVIDIA_DATA=
+
+
+if [[ "$1" == "list" || "$1" == "listjson" ]]; then
+	declare -A MEMINFO
+	if [[ -e $AMDMEMINFO_FILE ]]; then
+		#GPU:03.00.0:Radeon RX 570:113-2E366AU-X5T:Micron MT51J256M32:GDDR5:Polaris10
+		while IFS=":" read _gpu busid other; do
+			MEMINFO["${busid:--}"]="$other"
+		done < <( cat $AMDMEMINFO_FILE )
+	fi
+
+	if [[ "$2" == "AMD" ]]; then
+		list=`lspci | grep -E "$GPU_DETECT_STRING" | grep "AMD" | grep -vE "$GPU_AMD_INTERNAL"`
+	elif [[ "$2" == "NVIDIA" ]]; then
+		list=`lspci | grep -E "$GPU_DETECT_STRING" | grep "NVIDIA" | grep -vE "$GPU_NVIDIA_INTERNAL"`
+	else
+		list=`lspci | grep -E "$GPU_DETECT_STRING"`
+	fi
+
+	gpus=()
+	gpu_brand_i=-1
+
+	while read -r s; do
+		[[ -z "$s" ]] && continue
+		unset gputype
+		[[ "$s" =~ "NVIDIA" && ! "$s" =~ ($GPU_NVIDIA_INTERNAL) ]] &&
+			gputype="NVIDIA" && COLOR=$GREEN && gpu_brand_i=$((gpu_brand_i+1))
+		[[ "$s" =~ "AMD" && ! "$s" =~ ($GPU_AMD_INTERNAL) ]] &&
+			gputype="AMD" && COLOR=$RED && gpu_brand_i=$((gpu_brand_i+1))
+
+		re="^([0-9a-z\:\.]+) [^\:]+: (.*)\$"
+		[[ "$s" =~ $re ]]
+		busid=${BASH_REMATCH[1]}
+		#name=${BASH_REMATCH[2]}
+		name=`lspci -vmms "$busid" 2>/dev/null | grep -oP "^Device:\s\K.*"`
+		subvendor=`lspci -vmms "$busid" 2>/dev/null | grep -oP "SVendor:\s\K.*"`
+		additional=""
+
+		#echo $s >&2
+		#echo $busid >&2
+
+		if [[ $gputype == "AMD" ]]; then
+			IS_VEGA10=`lspci -vnns "$busid" 2>/dev/null | grep -cEi "$GPU_VEGA10"`
+			IS_VEGA20=`lspci -vnns "$busid" 2>/dev/null | grep -cEi "$GPU_VEGA20"`
+			IS_NAVI=`lspci -vnns "$busid" 2>/dev/null | grep -cEi "$GPU_NAVI"`
+
+			# Radeon RX 570:113-2E366AU-X5T:Micron MT51J256M32:GDDR5:Polaris10
+			IFS=":" read gpuname vbios memvendor memtype gpufamily < <( echo "${MEMINFO["${busid//\:/\.}"]}" ) #"
+
+			if [[ ! -z "$gpuname" ]]; then
+				name="$gpuname"
+				[[ $IS_VEGA10 -gt 0 || $IS_VEGA20 -gt 0 ]] &&
+					memvendor=`amdmemtweak  --current | grep -A 2 "$busid" | grep -oP "Memory: \K.*"`
+
+				mem=
+				# get card id
+				[[ `echo /sys/bus/pci/devices/0000:$busid/drm/card*/` =~ \/card([0-9]+)\/ ]]
+				cardno=${BASH_REMATCH[1]}
+				if [[ -z $cardno ]]; then
+					echo "ERROR: can not match card id for GPU $busid" >&2
+				else
+					# get fan pwm values
+					hwmondir=`realpath /sys/class/drm/card$cardno/device/hwmon/hwmon*/ 2>/dev/null`
+					[[ ! -z $hwmondir && -e ${hwmondir}/pwm1_max ]] && fanmax="`head -1 ${hwmondir}/pwm1_max`" || fanmax=255
+					[[ ! -z $hwmondir && -e ${hwmondir}/pwm1_min ]] && fanmin="`head -1 ${hwmondir}/pwm1_min`" || fanmin=0
+
+					if [[ -e /sys/class/drm/card$cardno/device/mem_info_vram_total ]]; then
+						mem="`cat /sys/class/drm/card$cardno/device/mem_info_vram_total 2>/dev/null`" && mem="$(( $mem/1024/1024 )) MB" || mem=
+					elif [[ -e /sys/kernel/debug/dri/$cardno/amdgpu_vram ]]; then
+						mem="`stat -c %s /sys/kernel/debug/dri/$cardno/amdgpu_vram 2>/dev/null`" && mem="$(( $mem/1024/1024 )) MB" || mem=
+					fi
+				fi
+				[[ -z "$mem" ]] && mem=`dmesg | grep -oP "amdgpu 0000:${busid}: VRAM:\s\K[^\s]+"`
+				#[   26.705145] amdgpu 0000:07:00.0: VRAM: 4096M 0x0000000000000000 - 0x00000000FFFFFFFF (4096M used)
+				#mem=`dmesg | grep -oE "amdgpu 0000:${busid}: VRAM:\s.*" | sed -n 's/.*VRAM:\s\([0-9MG]\+\).*/\1/p'`
+
+				additional=" ($mem, $vbios, $memvendor)"
+				if [[ $1 == "listjson" ]]; then
+					gpujson=`jq -n -c --arg busid "$busid" --arg name "$name" --arg brand "amd" --arg subvendor "$subvendor" \
+						--arg vbios "$vbios" --arg mem_type "$memvendor" \
+						'{$busid, $name, $brand, $subvendor, $vbios, $mem_type}'`
+					[[ ! -z "$mem" ]] && gpujson=`echo "$gpujson" | jq -c --arg mem "$mem" '. + {$mem}'`
+					[[ $fanmin -ne 0 ]] && gpujson=`echo "$gpujson" | jq -c --arg fanmin "$fanmin" '. + {$fanmin}'`
+					[[ $fanmax -ne 255 ]] && gpujson=`echo "$gpujson" | jq -c --arg fanmax "$fanmax" '. + {$fanmax}'`
+					gpus+=("$gpujson")
+					continue
+				fi
+			else
+				sname=`lspci -vmms "$busid" | grep -oP "SDevice:\s\K.*"`
+				if [[ "$sname" =~ (Radeon|RX) ]]; then
+					name="$sname"
+				elif [[ ! "$name" =~ (Radeon|RX) ]]; then
+					if [[ $IS_NAVI -gt 0 ]]; then
+						name="Radeon Navi $name"
+					elif [[ $IS_VEGA20 -gt 0 ]]; then
+						name="Radeon Vega20 $name"
+					elif [[ $IS_VEGA10 -gt 0 ]]; then
+						name="Radeon Vega10 $name"
+					else
+						name="Radeon $name"
+					fi
+				fi
+			fi
+
+		elif [[ $gputype == "NVIDIA" ]]; then
+			#[[ -z $NVIDIA_DATA && -f $NVIDIASMI_FILE_V2 ]] &&
+			#	NVIDIA_DATA=`cat $NVIDIASMI_FILE_V2 2>/dev/null`
+
+			if [[ -z "$NVIDIA_DATA" && $NV_OFF -eq 0 ]]; then
+				# 0;Success;00000000:05:00.0;P104-100;86.04.7A.00.19;8121;4125;3996;180.0;90.0;217.0;1;Micron GDDR5X;
+				NVIDIA_DATA=`nvtool --quiet --csv --statuscode --status --busid --name --vbios --meminfo \
+									--defpl --minmaxpl --fancount --memtype --statuscode 2>&1`
+				exitcode=$?
+				# suppress permission error at early boot
+				#{ echo "$NVIDIA_DATA" > $NVIDIASMI_FILE_V2; } 2>/dev/null
+				# check for status errors here and send all in one msg
+				msg=""
+				while IFS=";" read status statusmsg gpubusid gpuname others; do
+					[[ $status -eq 0 ]] && continue
+					# NVML_ERROR_INSUFFICIENT_POWER = 8
+					msg+="GPU ${gpubusid#00000000:} $gpuname - $statusmsg ($status)"$'\n'
+				done < <( echo "$NVIDIA_DATA" | grep -v "^0;" )
+
+				if [[ ! -z "$msg" ]]; then
+					echo "$msg" >&2
+					echo "$msg" | message error "Nvidia GPU error" payload > /dev/null
+				elif [[ $exitcode -ne 0 ]]; then
+					echo "nvtool error ($exitcode)" >&2
+					echo "$NVIDIA_DATA" | message error "nvtool error ($exitcode)" payload > /dev/null
+				fi
+			fi
+
+			IFS=";" read status statusmsg gpubusid gpuname vbios mem usedmem freemem plim_def plim_min plim_max fan_cnt memvendor others < <( echo "$NVIDIA_DATA" | grep -i "00000000:$busid" )
+			if [[ ! -z "$gpuname" ]]; then
+				[[ ! "$gpuname" =~ "Graphics Device" ]] && name="$gpuname"
+				[[ ! -z "$mem" ]] && mem="$mem MB"
+				[[ ! -z "$plim_min" ]] && plim_min="${plim_min/.0/} W"
+				[[ ! -z "$plim_def" ]] && plim_def="${plim_def/.0/} W"
+				[[ ! -z "$plim_max" ]] && plim_max="${plim_max/.0/} W"
+				#[[ -z $fan_cnt || $fan_cnt == 0 ]] && fan_cnt=1
+
+				additional=" ($mem, $plim_def, $memvendor)"
+				if [[ $1 == "listjson" ]]; then
+					gpujson=`jq -n -c --arg busid "$busid" --arg name "$name" --arg brand "nvidia" --arg subvendor "$subvendor" \
+						--arg mem "$mem" --arg vbios "$vbios" --arg mem_type "$memvendor" \
+						--arg plim_min "$plim_min" --arg plim_def "$plim_def" --arg plim_max "$plim_max" \
+						'{$busid, $name, $brand, $subvendor, $mem, $vbios, $mem_type, $plim_min, $plim_def, $plim_max}'`
+					[[ ! -z $fan_cnt && $fan_cnt -gt 1 ]] && gpujson=`echo "$gpujson" | jq -c --arg fan_cnt "$fan_cnt" '. + {$fan_cnt}'`
+					gpus+=("$gpujson")
+					continue
+				fi
+			fi
+		else #unknown type
+			#[[ $1 == "listjson" ]] && continue #we don't need internal gpu in report
+			COLOR=$YELLOW
+		fi
+
+		#default construction
+		if [[ $1 == "listjson" ]]; then
+			gpus+=(`jq -n -c --arg busid "$busid" --arg name "$name" --arg brand "cpu" --arg subvendor "$subvendor" '{$busid, $name, $brand, $subvendor}'`)
+			continue
+		fi
+
+		[[ $gpu_brand_i -ge 0 ]] && gpu_index=`printf "%2d" $gpu_brand_i` || gpu_index="  "
+		echo -e "${BLUE}${gpu_index}${NOCOLOR} $busid ${COLOR}$name${NOCOLOR}$additional"
+
+	done < <( echo "$list" )
+
+	if [[ ! -z "$2" && "$1" == "listjson" ]]; then
+		echo "${gpus[@]}" | jq --slurp .
+	elif [[ "$1" == "listjson" ]]; then
+		# add missing GPUs according to busid mapping
+		[[ -e $RIG_CONF ]] && source $RIG_CONF
+		[[ -e $BUSID_FILE ]] && source $BUSID_FILE
+		if [[ ! -z "$BUSID_MB" || ! -z "$BUSID_AMD" || ! -z "$BUSID_NVIDIA" ]]; then
+			NVIDIA_COUNT=`lspci | grep -E "$GPU_STRING" | grep "NVIDIA" | grep -vE "$GPU_NVIDIA_INTERNAL" | wc -l`
+			AMD_COUNT=`lspci | grep -E "$GPU_STRING" | grep "AMD" | grep -vE "$GPU_AMD_INTERNAL" | wc -l`
+			# use common bus id array for appropriate GPUs
+			[[ -z "$BUSID_NVIDIA" && $NVIDIA_COUNT -gt 0 && $AMD_COUNT -eq 0 ]] && BUSID_NVIDIA="$BUSID_MB"
+			[[ -z "$BUSID_AMD" && $AMD_COUNT -gt 0 && $NVIDIA_COUNT -eq 0 ]] && BUSID_AMD="$BUSID_MB"
+
+			arr=
+			name="GeForce"
+			for ARRAY in "$BUSID_NVIDIA" "$BUSID_AMD"; do
+				for busid in $ARRAY; do
+					busid=${busid,,} # use low case
+					if [[ $busid =~ ^[0-9a-f]{2}$ ]]; then
+						busid="$busid:00.0"
+					elif [[ $busid =~ ^[0-9a-f]{2}:[0-9a-f]{2}$ ]]; then
+						busid="$busid.0"
+					elif [[ ! $busid =~ ^[0-9a-f]{2}:[0-9a-f]{2}\.0$ ]]; then
+						continue
+					fi
+					arr+=(`jq -n -c --arg busid "$busid" --arg name "$name" --arg brand "cpu" --arg vbios "MISSING" '{$busid, $name, $brand, $vbios}'`)
+				done
+				name="Radeon"
+			done
+
+			misjson=`echo "${arr[@]}" | jq --slurp . | jq 'sort_by(.busid)'` || misjson="[]"
+		else
+			misjson="[]"
+		fi
+
+		# add disabled GPUs on boot
+		if [[ -e ${GPU_DETECT_JSON}.boot ]]; then
+			bootjson=`jq '.[] |= . + {"vbios":"DISABLED"}' ${GPU_DETECT_JSON}.boot` || bootjson="[]"
+		else
+			bootjson="[]"
+		fi
+
+		# join and sort
+		jq --argjson missed "$misjson" --argjson boot "$bootjson" --argjson current "$(echo "${gpus[@]}" | jq --slurp .)" \
+			-n '$current + $boot + $missed | unique_by(.busid)' 2>/dev/null || echo "${gpus[@]}" | jq --slurp .
+	fi
+
+elif [[ $1 == "listnvidia" ]]; then
+	list=`nvtool --quiet --space --busid --name --status`
+	echo "${list//00000000\:}"
+
+elif [[ $1 == "AMD" ]]; then
+	lspci | grep -E "$GPU_DETECT_STRING" | grep "AMD" | grep -vE "$GPU_AMD_INTERNAL" | wc -l
+elif [[ $1 == "AMD_FIRST" ]]; then
+	lspci | grep -E "$GPU_DETECT_STRING" | head -n 1 | grep "AMD" | grep -vE "$GPU_AMD_INTERNAL" | wc -l
+elif [[ $1 == "NVIDIA" ]]; then
+	lspci | grep -E "$GPU_DETECT_STRING" | grep "NVIDIA" | grep -vE "$GPU_NVIDIA_INTERNAL" | wc -l
+elif [[ $1 == "NVIDIA_FIRST" ]]; then
+	lspci | grep -E "$GPU_DETECT_STRING" | head -n 1 | grep "NVIDIA" | grep -vE "$GPU_NVIDIA_INTERNAL" | wc -l
+else
+	#default, just grep
+	lspci | grep -E "($GPU_DETECT_STRING).*$1" | wc -l
+fi
+

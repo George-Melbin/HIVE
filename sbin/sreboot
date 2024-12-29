@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+
+
+WAKEALARM_TIMEOUT=30 # default value
+WATCHDOGS=("watchdog-opendev" "hl340" "watchdoginua" "watchdog-octofan" "srrv2" "utility.py")
+#APT_WAIT=120 # wait time for apt/dpkg to finish
+
+
+if [[ $1 == "-h" || $1 == "--help" ]]; then
+	. colors
+	echo -e "Reboots or shutdowns the system using sysrq"
+	echo -e "Usage:"
+	echo -e "  ${YELLOW}sreboot${NOCOLOR} - just reboots"
+	echo -e "  ${YELLOW}sreboot shutdown${NOCOLOR} - shutdowns"
+	echo -e "  ${YELLOW}sreboot wakealarm [timeout]${NOCOLOR} - shutdowns and sets wake alarm in BIOS to [timeout] (default $WAKEALARM_TIMEOUT seconds)"
+	echo -e "  ${YELLOW}sreboot -h|--help${NOCOLOR} - shows this message"
+	exit 0
+fi
+
+if [[ $1 == "wakealarm" && ! -e /sys/class/rtc/rtc0/wakealarm ]]; then
+	message warn "wakealarm is not supported by this system"
+	exit 1
+fi
+
+
+POWERCYCLE=
+# include POWERCYCLE only if it is supported
+[[ -z $1 && -e "$RIG_CONF" && -e /sys/class/rtc/rtc0/wakealarm ]] && source $RIG_CONF
+
+
+fastmode=1
+if [[ $1 != "fast" ]]; then
+	read la1 la5 la15 procs < /proc/loadavg
+	[[ ${la1%.*} -lt 15 ]] && fastmode=0
+fi
+
+
+if [[ $fastmode -eq 0 ]]; then
+	# wait a bit if sreboot is already running
+	if pgrep sreboot >/dev/null; then
+		echo "> Reboot is already requested"
+		sleep 3
+	else
+		echo "> Preparing for reboot"
+	fi
+
+	# safely stop install to prevent database corruption
+	if [[ "$APT_WAIT" -gt 0 ]]; then
+		need_wait=0
+		killall -s INT apt 2>/dev/null && ((need_wait++))
+		killall -s INT apt-get 2>/dev/null && ((need_wait++))
+		killall -s INT dpkg 2>/dev/null && ((need_wait++))
+		[[ $need_wait -gt 0 ]] && apt-wait $APT_WAIT
+	fi
+	killall apt apt-get dpkg 2>/dev/null
+
+	# stop hw watchdogs pings
+	killall -s 9 ${WATCHDOGS[@]} 2>/dev/null
+fi
+
+
+#unRaw      (take control of keyboard back from X),
+# tErminate (send SIGTERM to all processes),
+# kIll      (send SIGKILL to all processes),
+#  Sync     (flush data to disk),
+#  Unmount  (remount all filesystems read-only),
+#reBoot.
+#‘o’ – Shutdown the system immediately.
+#‘t’ – Output a list of current tasks and their information to the console.
+
+echo 1 > /proc/sys/kernel/sysrq # enable
+
+#echo "> Flushing disks"
+echo s > /proc/sysrq-trigger # sync
+# wait for sync to really complete. it takes ages on slow drives
+#sync
+
+echo "> Unmounting disks"
+echo u > /proc/sysrq-trigger # umount
+sleep 1
+# use it instead of just sleeping. it also takes some time on slow drives
+[[ -d /hive-config && -w /hive-config ]] && umount -f /hive-config && mount -n -o ro /hive-config
+[[ -w / ]] && mount -f -o remount,ro /
+
+
+if [[ $1 == "shutdown" || $1 == "wakealarm" || $POWERCYCLE -ne 0 ]]; then
+	if [[ $1 != "shutdown" ]]; then
+		[[ ! -z $2 ]] && WAKEALARM_TIMEOUT=$2
+		echo "> Setting wakealarm to $WAKEALARM_TIMEOUT sec and shutting down"
+		echo 0 > /sys/class/rtc/rtc0/wakealarm
+		echo +$WAKEALARM_TIMEOUT > /sys/class/rtc/rtc0/wakealarm
+		echo o > /proc/sysrq-trigger # poweroff
+	fi
+	echo "> Shutting down"
+	[[ $2 == "fast" ]] && echo o > /proc/sysrq-trigger # poweroff
+	poweroff # -f
+else
+	if [[ $1 == "wd" ]]; then
+		echo "> Pushing watchdog reset"
+		/hive/opt/opendev/watchdog-opendev reset
+		/hive/opt/qinheng/hl340 reset
+		sleep 1
+	fi
+	echo "> Rebooting"
+	echo b > /proc/sysrq-trigger # reboot
+	reboot -f # does not work well on high LA
+fi
